@@ -6,6 +6,8 @@ import sys
 
 from aiogram import Bot, Dispatcher
 
+from bot_components.account_bootstrap import ensure_bot_in_channels
+from bot_components.account_source_listener import AccountSourceListener
 from bot_components.handlers import create_router, set_bot_menu
 from bot_components.state import BotState
 from config import BOT_TOKEN, SOURCE_CHANNEL_ID, TARGET_CHANNEL_ID
@@ -27,6 +29,7 @@ async def setup_bot() -> None:
     try:
         bot_info = await bot.get_me()
         logger.info("Bot started: @%s (ID: %s)", bot_info.username, bot_info.id)
+        await ensure_bot_in_channels(bot_info.username)
 
         state.collector = MediaGroupCollector(
             bot=bot,
@@ -34,6 +37,8 @@ async def setup_bot() -> None:
             db_path="queue.db",
         )
         await state.collector.initialize()
+        state.account_source_listener = AccountSourceListener(state.collector)
+        await state.account_source_listener.start()
         await set_bot_menu(bot)
 
         dispatcher.include_router(create_router(bot, state))
@@ -44,6 +49,9 @@ async def setup_bot() -> None:
 
 
 async def cleanup_bot() -> None:
+    if state.account_source_listener:
+        await state.account_source_listener.stop()
+
     if state.collector:
         await state.collector.cleanup()
         logger.info("Media group collector cleaned up")
@@ -53,9 +61,8 @@ async def cleanup_bot() -> None:
 
 
 async def main() -> None:
-    await setup_bot()
-
     try:
+        await setup_bot()
         logger.info("Starting bot polling...")
         await dispatcher.start_polling(
             bot,

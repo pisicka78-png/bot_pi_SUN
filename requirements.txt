@@ -2,3 +2,4 @@ aiogram==3.28.0
 aiosqlite==0.22.1
 apscheduler==3.10.4
 python-dotenv==1.0.0
+telethon==1.40.0

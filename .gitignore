@@ -21,9 +21,12 @@ queue.db
 *.db
 *.sqlite
 *.sqlite3
+*.session
+*.session-journal
 bot.log
 *.log
 logs/
+downloads/
 .idea/
 .vscode/
 .DS_Store

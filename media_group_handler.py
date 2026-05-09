@@ -1,11 +1,15 @@
+import asyncio
+from pathlib import Path
 from typing import Optional
 
 import aiosqlite
 from aiogram import Bot
-from aiogram.types import InputMediaPhoto, InputMediaVideo, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
+from config import SEND_CRON_HOUR, SEND_CRON_MINUTE, SEND_INTERVAL_MINUTES, SEND_MODE
 from logger_config import logger
 
 
@@ -31,11 +35,61 @@ class MediaGroupCollector:
         self.target_channel_id = target_channel_id
         self.db_path = db_path
         self.db: Optional[aiosqlite.Connection] = None
+        self.send_mode = SEND_MODE
+        self.send_interval_minutes = SEND_INTERVAL_MINUTES
+        self.send_cron_minute = SEND_CRON_MINUTE
+        self.send_cron_hour = SEND_CRON_HOUR
 
         self.scheduler = AsyncIOScheduler()
-        self.scheduler.add_job(self.send_one_from_queue, CronTrigger(minute="*/30"))
-        self.scheduler.start()
-        logger.info("Планувальник запущено: відправка за розкладом (кожні 30 хвилин)")
+        self._setup_scheduler()
+
+    def _setup_scheduler(self) -> None:
+        self.scheduler.remove_all_jobs()
+
+        if self.send_mode == "manual":
+            logger.info("Режим відправки: manual. Автоматична відправка вимкнена")
+            return
+
+        if self.send_mode == "immediate":
+            logger.info("Режим відправки: immediate. Черга відправляється одразу після додавання")
+            return
+
+        if self.send_mode == "interval":
+            self.scheduler.add_job(self.send_one_from_queue, IntervalTrigger(minutes=self.send_interval_minutes))
+            if not self.scheduler.running:
+                self.scheduler.start()
+            logger.info("Режим відправки: interval, кожні %s хв", self.send_interval_minutes)
+            return
+
+        if self.send_mode == "cron":
+            self.scheduler.add_job(
+                self.send_one_from_queue,
+                CronTrigger(hour=self.send_cron_hour, minute=self.send_cron_minute),
+            )
+            if not self.scheduler.running:
+                self.scheduler.start()
+            logger.info("Режим відправки: cron, hour=%s minute=%s", self.send_cron_hour, self.send_cron_minute)
+            return
+
+        logger.warning("Невідомий SEND_MODE=%s. Автоматична відправка вимкнена", self.send_mode)
+
+    def set_send_mode(self, mode: str) -> None:
+        if mode not in {"manual", "immediate", "interval", "cron"}:
+            raise ValueError(f"Unsupported send mode: {mode}")
+
+        self.send_mode = mode
+        self._setup_scheduler()
+
+    def get_send_mode_text(self) -> str:
+        if self.send_mode == "manual":
+            return "manual: тільки кнопка 🚀 Відправити або /send"
+        if self.send_mode == "immediate":
+            return "immediate: відправка одразу після додавання в чергу"
+        if self.send_mode == "interval":
+            return f"interval: автоматично кожні {self.send_interval_minutes} хв"
+        if self.send_mode == "cron":
+            return f"cron: hour={self.send_cron_hour}, minute={self.send_cron_minute}"
+        return f"{self.send_mode}: невідомий режим"
 
     async def initialize(self) -> None:
         try:
@@ -66,6 +120,45 @@ class MediaGroupCollector:
             logger.info("Повідомлення %s пропущено: підтримуються тільки photo/video", message.message_id)
             return False
 
+        return await self._insert_queue_item(
+            origin_msg_id=message.message_id,
+            group_id=custom_group_id,
+            file_id=file_id,
+            file_type=file_type,
+            caption=custom_caption,
+            log_prefix="Додано в чергу",
+        )
+
+    async def add_local_media(
+        self,
+        origin_msg_id: int,
+        group_id: str,
+        file_path: str,
+        file_type: str,
+        caption: str,
+    ) -> bool:
+        if file_type not in {"local_video", "local_photo"}:
+            logger.error("Непідтримуваний локальний тип медіа: %s", file_type)
+            return False
+
+        return await self._insert_queue_item(
+            origin_msg_id=origin_msg_id,
+            group_id=group_id,
+            file_id=file_path,
+            file_type=file_type,
+            caption=caption,
+            log_prefix="Додано локальне медіа в чергу",
+        )
+
+    async def _insert_queue_item(
+        self,
+        origin_msg_id: int,
+        group_id: str,
+        file_id: str,
+        file_type: str,
+        caption: str,
+        log_prefix: str,
+    ) -> bool:
         try:
             db = self._require_db()
             await db.execute(
@@ -73,19 +166,26 @@ class MediaGroupCollector:
                 INSERT INTO queue (media_group_id, origin_msg_id, file_id, file_type, caption)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (custom_group_id, message.message_id, file_id, file_type, custom_caption),
+                (group_id, origin_msg_id, file_id, file_type, caption),
             )
             await db.commit()
             logger.info(
-                "Додано в чергу: message_id=%s group_id=%s type=%s",
-                message.message_id,
-                custom_group_id,
+                "%s: message_id=%s group_id=%s type=%s file=%s",
+                log_prefix,
+                origin_msg_id,
+                group_id,
                 file_type,
+                file_id,
             )
+            await self.send_after_enqueue()
             return True
         except Exception as e:
-            logger.error("Помилка БД: %s", e)
+            logger.error("Помилка БД при додаванні в чергу: %s", e)
             return False
+
+    async def send_after_enqueue(self) -> None:
+        if self.send_mode == "immediate":
+            await self.send_one_from_queue()
 
     async def update_message_in_db(self, message: Message, custom_caption: str = "") -> None:
         try:
@@ -118,6 +218,10 @@ class MediaGroupCollector:
             rows = await self._get_group_rows(db, group_id)
             if not rows:
                 return False
+            if not self._local_files_exist(rows):
+                await self._delete_group(db, group_id)
+                logger.error("Групу %s видалено з черги: локальний файл відсутній", group_id)
+                return False
 
             if len(rows) == 1:
                 await self._send_single(rows[0])
@@ -127,7 +231,8 @@ class MediaGroupCollector:
                 log_label = "Альбом"
 
             await self._delete_group(db, group_id)
-            logger.info("✅ %s %s успішно відправлено", log_label, group_id)
+            await self._cleanup_local_files(rows)
+            logger.info("%s %s успішно відправлено", log_label, group_id)
             return True
         except Exception as e:
             logger.error("Помилка у send_one_from_queue: %s", e)
@@ -169,6 +274,24 @@ class MediaGroupCollector:
             )
             return
 
+        if file_type == "local_video":
+            await self.bot.send_video(
+                chat_id=self.target_channel_id,
+                video=FSInputFile(file_id),
+                caption=caption,
+                parse_mode="HTML",
+            )
+            return
+
+        if file_type == "local_photo":
+            await self.bot.send_photo(
+                chat_id=self.target_channel_id,
+                photo=FSInputFile(file_id),
+                caption=caption,
+                parse_mode="HTML",
+            )
+            return
+
         raise ValueError(f"Unsupported queued file type: {file_type}")
 
     async def _send_album(self, rows: list[QueueRow]) -> None:
@@ -181,14 +304,43 @@ class MediaGroupCollector:
                 media.append(InputMediaVideo(media=file_id, caption=caption, parse_mode="HTML"))
             elif file_type == "photo":
                 media.append(InputMediaPhoto(media=file_id, caption=caption, parse_mode="HTML"))
+            elif file_type == "local_video":
+                media.append(InputMediaVideo(media=FSInputFile(file_id), caption=caption, parse_mode="HTML"))
+            elif file_type == "local_photo":
+                media.append(InputMediaPhoto(media=FSInputFile(file_id), caption=caption, parse_mode="HTML"))
             else:
                 raise ValueError(f"Unsupported queued file type: {file_type}")
 
         await self.bot.send_media_group(chat_id=self.target_channel_id, media=media)
 
+    @staticmethod
+    def _local_files_exist(rows: list[QueueRow]) -> bool:
+        for file_path, file_type, _ in rows:
+            if file_type.startswith("local_") and not Path(file_path).exists():
+                return False
+        return True
+
+    @staticmethod
+    async def _cleanup_local_files(rows: list[QueueRow]) -> None:
+        for file_path, file_type, _ in rows:
+            if not file_type.startswith("local_"):
+                continue
+            for attempt in range(3):
+                try:
+                    Path(file_path).unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        logger.error("Не вдалося видалити локальний файл %s: файл зайнятий", file_path)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error("Не вдалося видалити локальний файл %s: %s", file_path, e)
+                    break
+
     async def cleanup(self) -> None:
         try:
-            self.scheduler.shutdown()
+            if self.scheduler.running:
+                self.scheduler.shutdown()
             if self.db:
                 await self.db.close()
             logger.info("Media group collector очищено")

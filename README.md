@@ -1,163 +1,188 @@
 # Telegram Media Queue Bot
 
-Бот читає нові пости з одного Telegram-каналу, зберігає фото/відео в локальну SQLite-чергу через Telegram `file_id`, а потім публікує їх в інший канал як нові повідомлення. Це не звичайний forward, тому в цільовому каналі не має бути позначки `Переслано від`.
+Бот переносить фото/відео з одного Telegram-каналу в інший через чергу SQLite.
 
-## Що вміє бот
+Є два режими читання source-каналу:
 
-- слухає `channel_post` тільки з каналу `SOURCE_CHANNEL_ID`;
-- приймає одиночні фото/відео та Telegram-альбоми;
-- замінює знайдені посилання в тексті/підписі на `TARGET_LINK`;
-- зберігає `file_id`, тип медіа, підпис і групу в `queue.db`;
-- кожні 30 хвилин відправляє найстаріший об'єкт із черги в `TARGET_CHANNEL_ID`;
-- після успішної відправки видаляє запис із `queue.db`;
-- має ручне меню в особистому чаті з ботом;
-- після перезапуску продовжує працювати з тієї ж черги, якщо `queue.db` не видалений.
+- **Bot API** - бот має бути адміном у source-каналі.
+- **Account source** - Telegram-акаунт підписаний на source-канал, читає нові пости через Telethon і завантажує медіа локально. У цьому режимі бота не треба додавати в source-канал.
 
-## Структура проекту
+## Поточна схема
 
-- `main.py` - точка входу, запуск polling, підключення router.
-- `config.py` - читає `.env` через `python-dotenv`.
-- `logger_config.py` - налаштовує консольні логи та `bot.log`.
-- `media_group_handler.py` - робота з SQLite-чергою та відправкою медіа.
-- `bot_components/handlers.py` - команди, меню, обробники каналів.
-- `bot_components/album_middleware.py` - збір альбомів по `media_group_id`.
-- `bot_components/text_processing.py` - заміна посилань у HTML-тексті.
-- `bot_components/state.py` - runtime-state для доступу до collector.
+Для сценарію, де бот не доданий у source:
 
-## Налаштування `.env`
+1. акаунт Alesya підключається через Telethon;
+2. акаунт слухає `SOURCE_CHANNEL_REF`, наприклад `@bedia_studio`;
+3. нові фото/відео завантажуються в `downloads/`;
+4. шлях до файлу записується в `queue.db`;
+5. Bot API відправляє медіа в `TARGET_CHANNEL_ID`, наприклад канал `@bigpenisist`;
+6. після успішної відправки запис із БД і локальний файл видаляються.
 
-Створи файл `.env` у корені проекту. Приклад є в `.env.example`.
+## Структура
+
+- `main.py` - запуск бота, polling, lifecycle.
+- `config.py` - читає `.env`.
+- `media_group_handler.py` - SQLite-черга і відправка медіа.
+- `bot_components/handlers.py` - команди, меню, Bot API handlers.
+- `bot_components/account_source_listener.py` - слухає source через Telegram-акаунт.
+- `bot_components/account_bootstrap.py` - опціонально додає/піднімає бота в target через акаунт.
+- `bot_components/album_middleware.py` - збір Bot API альбомів.
+- `bot_components/text_processing.py` - заміна посилань.
+
+## `.env`
+
+Приклад:
 
 ```env
-BOT_TOKEN=your-telegram-bot-token
+BOT_TOKEN=your-bot-token
 SOURCE_CHANNEL_ID=-1001234567890
-TARGET_CHANNEL_ID=-1009876543210
+TARGET_CHANNEL_ID=-1003963815868
 TARGET_LINK=https://t.me/your_channel
 LOG_LEVEL=INFO
+
+ACCOUNT_BOOTSTRAP_ENABLED=true
+TELEGRAM_API_ID=123456
+TELEGRAM_API_HASH=your-api-hash
+TELEGRAM_USER_PHONE=+380000000000
+TELEGRAM_SESSION=telegram_account
+BOT_USERNAME=big_penisist_bot
+SOURCE_CHANNEL_REF=@bedia_studio
+TARGET_CHANNEL_REF=@bigpenisist
+ACCOUNT_SOURCE_ENABLED=true
+ACCOUNT_SOURCE_DOWNLOAD_DIR=downloads
+SEND_MODE=manual
+SEND_INTERVAL_MINUTES=30
+SEND_CRON_HOUR=*
+SEND_CRON_MINUTE=*/30
 ```
 
-### Ключі
+### Основні ключі
 
 - `BOT_TOKEN` - токен бота з `@BotFather`.
-- `SOURCE_CHANNEL_ID` - id каналу, звідки бот бере нові фото/відео.
-- `TARGET_CHANNEL_ID` - id каналу, куди бот публікує чергу.
-- `TARGET_LINK` - посилання, на яке бот замінює всі знайдені `https://...` та `t.me/...` у підписах.
-- `LOG_LEVEL` - рівень логів. Зазвичай достатньо `INFO`.
+- `SOURCE_CHANNEL_ID` - id source-каналу для Bot API режиму.
+- `TARGET_CHANNEL_ID` - id target-каналу, куди бот публікує.
+- `TARGET_LINK` - посилання, на яке замінюються знайдені URL у підписах.
+- `LOG_LEVEL` - рівень логів.
 
-### Де взяти channel id
+### Ключі акаунта
 
-1. Додай ID-бота, наприклад `@userinfobot` або `@getmyid_bot`.
-2. Перешли йому пост із потрібного каналу.
-3. Він покаже id у форматі:
+- `ACCOUNT_SOURCE_ENABLED=true` - читати source-канал через акаунт.
+- `TELEGRAM_API_ID` і `TELEGRAM_API_HASH` - з `https://my.telegram.org`.
+- `TELEGRAM_USER_PHONE` - номер Telegram-акаунта.
+- `TELEGRAM_SESSION` - назва локального session-файлу.
+- `SOURCE_CHANNEL_REF` - username source-каналу, наприклад `@bedia_studio`.
+- `TARGET_CHANNEL_REF` - username target-каналу, наприклад `@bigpenisist`.
+- `BOT_USERNAME` - username бота без або з `@`.
 
-```text
--1001234567890
+`ACCOUNT_BOOTSTRAP_ENABLED=true` пробує через акаунт додати/підняти бота в target-каналі. Для цього акаунт має бути власником або адміном target-каналу з правами додавати адміністраторів.
+
+## Режим відправки
+
+Режим задається в `.env` через `SEND_MODE`.
+
+```env
+SEND_MODE=manual
 ```
 
-Для цього проекту потрібні два різні id:
+Доступні значення:
 
-- source - канал-джерело;
-- target - канал-приймач.
+- `manual` - бот тільки складає медіа в чергу. Відправка тільки вручну через `🚀 Відправити` або `/send`.
+- `immediate` - бот відправляє медіа одразу після додавання в чергу.
+- `interval` - бот відправляє один об'єкт із черги кожні `SEND_INTERVAL_MINUTES`.
+- `cron` - бот відправляє за cron-розкладом `SEND_CRON_HOUR` + `SEND_CRON_MINUTE`.
 
-## Права в Telegram
+Приклади:
 
-Бот має бути адміністратором в обох каналах.
-
-У source-каналі бот повинен отримувати нові пости. У target-каналі бот повинен мати право публікувати повідомлення.
-
-Важливо: додавай саме того бота, токен якого стоїть у `BOT_TOKEN`. Перевірити це можна командою:
-
-```text
-/check
+```env
+SEND_MODE=immediate
 ```
 
-## Запуск
+```env
+SEND_MODE=interval
+SEND_INTERVAL_MINUTES=10
+```
 
-Встанови залежності:
+```env
+SEND_MODE=cron
+SEND_CRON_HOUR=9,13,18
+SEND_CRON_MINUTE=0
+```
+
+## Перший запуск акаунта
+
+Встановити залежності:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Запусти бота:
+Запустити в консолі:
 
 ```bash
 python main.py
 ```
 
-Після запуску напиши боту в особисті повідомлення:
+Першого разу Telethon попросить код входу з Telegram. Після входу створиться:
+
+```text
+telegram_account.session
+```
+
+Цей файл не можна комітити. Він уже доданий у `.gitignore`.
+
+## Меню бота
+
+У особистому чаті з ботом:
 
 ```text
 /start
 ```
 
-Бот покаже меню.
+Кнопки:
 
-## Меню бота
+- `📦 Статус` - показати чергу.
+- `🚀 Відправити` - відправити перший об'єкт із черги.
+- `🔍 Перевірити доступ` - перевірити source/target.
+- `🎯 Тест target` - надіслати тест у target.
+- `🗝 Пасхалка` - секретна відповідь.
+- `ℹ️ Допомога` - підказка.
 
-Після `/start` з'являється клавіатура:
+## Черга
 
-- `📦 Статус` - показує кількість медіафайлів і груп у черзі.
-- `🚀 Відправити` - вручну відправляє перший об'єкт із черги.
-- `🔍 Перевірити доступ` - перевіряє source/target канали.
-- `🎯 Тест target` - надсилає тестове повідомлення в target-канал.
-- `🗝 Пасхалка` - показує випадкове секретне повідомлення.
-- `ℹ️ Допомога` - повторно показує інструкцію.
+Bot API режим зберігає Telegram `file_id`.
 
-Команди також працюють:
+Account source режим зберігає локальний шлях до файлу в `downloads/`.
 
-```text
-/status
-/send
-/check
-/testtarget
-/secret
-```
+Таблиця `queue`:
 
-## Як працює черга
+- `media_group_id`;
+- `origin_msg_id`;
+- `file_id` - Telegram `file_id` або локальний шлях;
+- `file_type` - `photo`, `video`, `local_photo`, `local_video`;
+- `caption`;
+- `added_at`.
 
-Бот не завантажує відеофайли на диск. Він бере Telegram `file_id` і записує його в `queue.db`.
-
-У таблиці `queue` зберігаються:
-
-- `media_group_id` - id альбому або штучний `single_<message_id>` для одиночного медіа;
-- `origin_msg_id` - id поста в source-каналі;
-- `file_id` - Telegram id файлу;
-- `file_type` - `photo` або `video`;
-- `caption` - оброблений підпис;
-- `added_at` - час додавання.
-
-Якщо бот вимкнути і запустити знову, він відкриє той самий `queue.db` і продовжить відправку. Якщо видалити `queue.db`, черга буде втрачена.
+Після перезапуску бот продовжує працювати з `queue.db`. Якщо видалити `queue.db`, черга зникне.
 
 ## Відправка
 
-Автоматична відправка працює кожні 30 хвилин:
+Автоматично кожні 30 хвилин:
 
 ```python
 CronTrigger(minute="*/30")
 ```
 
-За один запуск відправляється одна найстаріша група з черги.
+Вручну через меню або:
 
-Одиночне фото/відео відправляється через `send_photo` або `send_video`. Альбом відправляється через `send_media_group`.
+```text
+/send
+```
 
 ## Обмеження
 
-- текстові пости без фото/відео не додаються в чергу;
-- документи, аудіо, voice, stickers, animations не обробляються;
-- Telegram-альбом більше 10 елементів може не відправитися;
-- підпис при альбомі ставиться тільки на перший елемент;
-- видалення постів у source-каналі не синхронізується з чергою;
-- `/send` не обмежений конкретним адміном;
-- у БД немає унікального обмеження проти дублів;
-- збір альбому тримається в пам'яті приблизно `0.5` секунди, тому при дуже повільній доставці Telegram частини альбому можуть роз'їхатися.
-
-## Локальні файли
-
-Під час роботи можуть створюватися:
-
-- `queue.db` - SQLite-черга;
-- `bot.log` - логи;
-- `__pycache__/` - Python cache.
-
-Ці файли додані в `.gitignore` і не повинні потрапляти в репозиторій.
+- старі пости не підтягнуться, бот/акаунт бачить тільки нові після запуску;
+- текст без фото/відео не додається в чергу;
+- документи, audio, voice, sticker не обробляються;
+- великий альбом може не відправитися через ліміти Telegram;
+- `/send` поки не обмежений конкретним адміном;
+- якщо account source читає канал, медіа тимчасово лежить у `downloads/`.
